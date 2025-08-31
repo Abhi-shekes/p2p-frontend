@@ -4,7 +4,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
 
 const SIGNALING_URL = process.env.NEXT_PUBLIC_SIGNALING_URL || "http://localhost:4000";
-const STUN_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
+const STUN_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+  { urls: "stun:stun2.l.google.com:19302" },
+  { urls: "stun:stun3.l.google.com:19302" },
+  { urls: "stun:stun4.l.google.com:19302" },
+];
 const CHUNK_SIZE = 64 * 1024; // 64KB
 
 function ProgressBar({ label, progress }) {
@@ -93,6 +99,9 @@ export default function HomePage() {
   const [dragOver, setDragOver] = useState(false);
   const [sendProgress, setSendProgress] = useState(0); // Track overall progress for multiple files
   const [currentFileIndex, setCurrentFileIndex] = useState(0); // Track which file is being sent
+  const [recvProgress, setRecvProgress] = useState(0);
+
+  const iceCandidateQueueRef = useRef([]);
 
   const ensureSocket = useCallback(() => {
     if (socketRef.current && socketRef.current.connected) return socketRef.current;
@@ -100,9 +109,27 @@ export default function HomePage() {
       const s = io(SIGNALING_URL, {
         transports: ["websocket"],
         autoConnect: true,
+        reconnection: true,
+        reconnectionAttempts: Infinity,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 5000,
+        randomizationFactor: 0.5,
       });
       socketRef.current = s;
       setSocket(s);
+
+      s.on("reconnect", (attempt) => {
+        console.log(`Reconnected to signaling server after ${attempt} attempts`);
+        if (sessionTokenRef.current) {
+          s.emit("register", { token: sessionTokenRef.current });
+        }
+      });
+
+      s.on("reconnect_error", (err) => {
+        console.error("Reconnection error:", err);
+        setError("Failed to reconnect to signaling server.");
+        setStatus("error");
+      });
     } else if (!socketRef.current.connected) {
       try {
         socketRef.current.connect();
@@ -124,10 +151,12 @@ export default function HomePage() {
       if (pcRef.current) {
         pcRef.current.onicecandidate = null;
         pcRef.current.onconnectionstatechange = null;
+        pcRef.current.oniceconnectionstatechange = null;
         pcRef.current.ondatachannel = null;
         pcRef.current.close();
       }
       pcRef.current = null;
+      iceCandidateQueueRef.current = [];
     } catch {}
   }, []);
 
@@ -229,11 +258,13 @@ export default function HomePage() {
     s.removeAllListeners("connect_error");
     s.removeAllListeners("disconnect");
 
-    s.on("connect_error", () => {
+    s.on("connect_error", (err) => {
+      console.error("Connect error:", err);
       setError("Failed to connect to signaling server.");
       setStatus("error");
     });
     s.on("disconnect", (reason) => {
+      console.log("Disconnected:", reason);
       if (reason !== "io client disconnect") {
         setError("Disconnected from signaling server.");
         if (status !== "completed") setStatus("error");
@@ -259,21 +290,45 @@ export default function HomePage() {
     s.on("signal", async ({ type, data }) => {
       const pc = pcRef.current;
       if (!pc) return;
-      if (type === "offer") {
-        await pc.setRemoteDescription(data);
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        s.emit("signal", {
-          token: sessionTokenRef.current,
-          type: "answer",
-          data: pc.localDescription,
-        });
-      } else if (type === "answer") {
-        await pc.setRemoteDescription(data);
-      } else if (type === "ice") {
-        try {
-          await pc.addIceCandidate(data);
-        } catch {}
+      try {
+        if (type === "offer") {
+          await pc.setRemoteDescription(data);
+          for (const candidate of iceCandidateQueueRef.current) {
+            try {
+              await pc.addIceCandidate(candidate);
+            } catch {}
+          }
+          iceCandidateQueueRef.current = [];
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          s.emit("signal", {
+            token: sessionTokenRef.current,
+            type: "answer",
+            data: pc.localDescription,
+          });
+        } else if (type === "answer") {
+          await pc.setRemoteDescription(data);
+          for (const candidate of iceCandidateQueueRef.current) {
+            try {
+              await pc.addIceCandidate(candidate);
+            } catch {}
+          }
+          iceCandidateQueueRef.current = [];
+        } else if (type === "ice") {
+          if (pc.remoteDescription) {
+            try {
+              await pc.addIceCandidate(data);
+            } catch (err) {
+              console.error("Failed to add ICE candidate:", err);
+            }
+          } else {
+            iceCandidateQueueRef.current.push(data);
+          }
+        }
+      } catch (err) {
+        console.error("Signal handling error:", err);
+        setError("Signaling error: " + err.message);
+        setStatus("error");
       }
     });
 
@@ -310,9 +365,22 @@ export default function HomePage() {
       };
 
       pc.onconnectionstatechange = () => {
+        console.log("Connection state:", pc.connectionState);
         if (pc.connectionState === "connected") {
           setStatus("connected");
         } else if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+          setError("Peer connection failed or disconnected.");
+          setStatus("error");
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        console.log("ICE connection state:", pc.iceConnectionState);
+        if (pc.iceConnectionState === "failed") {
+          setError("ICE connection failed. Check network or add TURN servers.");
+          setStatus("error");
+        } else if (pc.iceConnectionState === "disconnected") {
+          setError("ICE connection disconnected.");
           setStatus("error");
         }
       };
@@ -332,7 +400,7 @@ export default function HomePage() {
       }
     } catch (err) {
       console.error("WebRTC init error:", err);
-      setError("WebRTC init failed");
+      setError("WebRTC init failed: " + err.message);
       setStatus("error");
     }
   }
@@ -347,17 +415,25 @@ export default function HomePage() {
     dcRef.current = dc;
     dc.bufferedAmountLowThreshold = CHUNK_SIZE * 4;
     dc.onopen = () => {
+      console.log("Data channel open");
       setStatus("connected");
     };
-    dc.onclose = () => {};
-    dc.onerror = () => {
-      setError("Data channel error");
+    dc.onclose = () => {
+      console.log("Data channel closed");
+      if (status === "transferring") {
+        setError("Transfer interrupted: data channel closed unexpectedly");
+        setStatus("error");
+      }
+    };
+    dc.onerror = (evt) => {
+      console.error("Data channel error:", evt);
+      setError(`Data channel error: ${evt.message || "Unknown error"}`);
       setStatus("error");
     };
 
     dc.onmessage = (evt) => {
-      if (typeof evt.data === "string") {
-        try {
+      try {
+        if (typeof evt.data === "string") {
           const meta = JSON.parse(evt.data);
           if (meta && meta.type === "meta" && meta.name && meta.size != null) {
             recvMetaRef.current = meta;
@@ -366,16 +442,22 @@ export default function HomePage() {
             setRecvProgress(0);
             setStatus("transferring");
           }
-        } catch {
-          // ignore
+        } else if (evt.data instanceof ArrayBuffer || evt.data?.byteLength >= 0) {
+          const maybePromise = evt.data instanceof ArrayBuffer ? evt.data : evt.data.arrayBuffer();
+          if (maybePromise.then) {
+            maybePromise.then(storeChunk).catch((err) => {
+              console.error("Chunk processing error:", err);
+              setError("Error processing received chunk");
+              setStatus("error");
+            });
+          } else {
+            storeChunk(maybePromise);
+          }
         }
-      } else if (evt.data instanceof ArrayBuffer || evt.data?.byteLength >= 0) {
-        const maybePromise = evt.data instanceof ArrayBuffer ? evt.data : evt.data.arrayBuffer();
-        if (maybePromise.then) {
-          maybePromise.then(storeChunk);
-        } else {
-          storeChunk(maybePromise);
-        }
+      } catch (err) {
+        console.error("Message handling error:", err);
+        setError("Error handling received message");
+        setStatus("error");
       }
     };
 
@@ -404,8 +486,6 @@ export default function HomePage() {
     }
   }
 
-  const [recvProgress, setRecvProgress] = useState(0);
-
   async function onPickFile(e) {
     const files = Array.from(e.target.files || []);
     setSelectedFiles(files); // Store selected files
@@ -421,7 +501,14 @@ export default function HomePage() {
     setCurrentFileIndex(0);
 
     for (let i = 0; i < selectedFiles.length; i++) {
-      await sendFile(selectedFiles[i], i === selectedFiles.length - 1); // Send each file
+      try {
+        await sendFile(selectedFiles[i], i === selectedFiles.length - 1); // Send each file
+      } catch (err) {
+        console.error("Send files error:", err);
+        setError("File transfer failed: " + err.message);
+        setStatus("error");
+        break;
+      }
     }
   }
 
@@ -474,9 +561,9 @@ export default function HomePage() {
       } else {
         setCurrentFileIndex(currentFileIndex + 1);
       }
-    } catch {
-      setError("Send failed");
-      setStatus("error");
+    } catch (err) {
+      console.error("Send file error:", err);
+      throw err;
     }
   }
 
@@ -484,7 +571,10 @@ export default function HomePage() {
     e.preventDefault();
     e.stopPropagation();
     setDragOver(false);
-    if (!dcRef.current || dcRef.current.readyState !== "open") return;
+    if (!dcRef.current || dcRef.current.readyState !== "open" || status !== "connected") {
+      setError("Cannot upload files until peer is connected.");
+      return;
+    }
     const files = Array.from(e.dataTransfer?.files || []);
     setSelectedFiles(files);
   }
@@ -548,6 +638,22 @@ export default function HomePage() {
       window.removeEventListener("online", onOnline);
     };
   }, [expiresAt, status]);
+
+  useEffect(() => {
+    let timeoutId;
+    if (status === "waiting") {
+      timeoutId = setTimeout(() => {
+        if (status === "waiting") {
+          setError("Connection timeout: peer did not connect in time.");
+          setStatus("error");
+          resetState();
+        }
+      }, 5 * 60 * 1000); // 5 minutes timeout for waiting
+    }
+    return () => {
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+  }, [status, resetState]);
 
   const shareText = useMemo(() => {
     const isHost = roleRef.current === "host";
@@ -635,81 +741,85 @@ export default function HomePage() {
         </section>
 
         <section className="flex flex-col gap-4 p-4 border rounded-lg">
-          <h2 className="font-semibold">Transfer</h2>
+  <h2 className="font-semibold">Transfer</h2>
 
-          {(() => {
-            const canSend =
-              !!dcRef.current &&
-              dcRef.current.readyState === "open" &&
-              roleRef.current === "host" &&
-              status !== "completed";
-            const waiting = status === "waiting" || status === "idle";
-            return (
-              <>
-                <div className="text-xs text-muted-foreground">
-                  {canSend
-                    ? "Connected. You can select and send files now."
-                    : waiting
-                    ? "Waiting for peer to connect..."
-                    : status === "connected"
-                    ? "Channel open soon..."
-                    : null}
-                </div>
-                {roleRef.current === "host" && status !== "completed" && (
-                  <div className="flex flex-col gap-3">
-                    <label className="text-sm">Select files to send</label>
-                    <div className="flex gap-2">
-                      <input
-                        type="file"
-                        multiple // Enable multiple file selection
-                        onChange={onPickFile}
-                        className="px-3 py-2 rounded border bg-background"
-                        disabled={!canSend}
-                        aria-label="Select files"
-                      />
-                      <button
-                        className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700"
-                        onClick={sendFiles}
-                        disabled={!canSend || !selectedFiles.length}
-                        aria-disabled={!canSend || !selectedFiles.length}
-                      >
-                        Send
-                      </button>
-                    </div>
-                    {selectedFiles.length > 0 && (
-                      <div className="text-sm">
-                        Selected files: {selectedFiles.map((f) => f.name).join(", ")}
-                      </div>
-                    )}
-                    {sendProgress > 0 && <ProgressBar label="Upload" progress={sendProgress} />}
+  {(() => {
+    const canSend =
+      !!dcRef.current &&
+      dcRef.current.readyState === "open" &&
+      roleRef.current === "host" &&
+      status === "connected"; // Ensure status is explicitly "connected"
+    const waiting = status === "waiting" || status === "idle";
 
-                    <div className="flex gap-2">
-                      <button
-                        className="px-3 py-2 rounded border"
-                        onClick={cancelTransfer}
-                        disabled={status !== "transferring" && status !== "connected"}
-                        aria-disabled={status !== "transferring" && status !== "connected"}
-                      >
-                        Cancel
-                      </button>
-                      <button className="px-3 py-2 rounded border" onClick={resetState}>
-                        Reset
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </>
-            );
-          })()}
-
-          {recvProgress > 0 && <ProgressBar label="Download" progress={recvProgress} />}
-
-          {error && (
-            <div className="text-sm text-red-600" role="alert">
-              Error: {error}
+    return (
+      <>
+        <div className="text-xs text-muted-foreground">
+          {canSend
+            ? "Connected. You can select and send files now."
+            : waiting
+            ? "Waiting for peer to connect..."
+            : status === "connected"
+            ? "Channel opening..."
+            : status === "completed"
+            ? "Transfer completed."
+            : "Connecting..."}
+        </div>
+        {roleRef.current === "host" && status !== "completed" && (
+          <div className="flex flex-col gap-3">
+            <label className="text-sm">Select files to send</label>
+            <div className="flex gap-2">
+              <input
+                type="file"
+                multiple
+                onChange={onPickFile}
+                className="px-3 py-2 rounded border bg-background"
+                disabled={!canSend} // Disable until peer is connected
+                aria-label="Select files"
+                aria-disabled={!canSend}
+              />
+              <button
+                className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                onClick={sendFiles}
+                disabled={!canSend || !selectedFiles.length} // Disable until peer is connected and files are selected
+                aria-disabled={!canSend || !selectedFiles.length}
+              >
+                Send
+              </button>
             </div>
-          )}
-        </section>
+            {selectedFiles.length > 0 && (
+              <div className="text-sm">
+                Selected files: {selectedFiles.map((f) => f.name).join(", ")}
+              </div>
+            )}
+            {sendProgress > 0 && <ProgressBar label="Upload" progress={sendProgress} />}
+
+            <div className="flex gap-2">
+              <button
+                className="px-3 py-2 rounded border disabled:opacity-50"
+                onClick={cancelTransfer}
+                disabled={status !== "transferring" && status !== "connected"}
+                aria-disabled={status !== "transferring" && status !== "connected"}
+              >
+                Cancel
+              </button>
+              <button className="px-3 py-2 rounded border" onClick={resetState}>
+                Reset
+              </button>
+            </div>
+          </div>
+        )}
+      </>
+    );
+  })()}
+
+  {recvProgress > 0 && <ProgressBar label="Download" progress={recvProgress} />}
+
+  {error && (
+    <div className="text-sm text-red-600" role="alert">
+      Error: {error}
+    </div>
+  )}
+</section>
 
         <footer className="text-xs text-muted-foreground">
           Signaling: {SIGNALING_URL} • STUN: stun.l.google.com:19302
